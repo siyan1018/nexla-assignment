@@ -1,0 +1,141 @@
+import fitz  # PyMuPDF
+import os
+import re
+
+
+# ---------------------------------------------------------------------------
+# Artifact cleaning
+# ---------------------------------------------------------------------------
+
+# Matches hex-looking tokens like UD54G1Dy, UD547FDv, etc.
+# These are watermark / encoding artifacts injected by PyMuPDF
+# when the PDF has an embedded font map or DRM watermark layer.
+_ARTIFACT_RE = re.compile(r'\b[A-Z]{2}[0-9A-Fa-f]{6,}\b')
+
+# Collapse 3+ consecutive whitespace/newline chars into a single space
+_WHITESPACE_RE = re.compile(r'\s{3,}')
+
+
+def clean_page_text(text: str) -> str:
+    """
+    Strip PDF extraction artifacts and normalise whitespace.
+
+    Steps
+    -----
+    1. Remove hex watermark tokens (UD54G1Dy-style).
+    2. Remove non-ASCII characters that slipped through font mapping.
+    3. Collapse runs of whitespace / newlines into single spaces.
+    4. Strip leading/trailing whitespace.
+    """
+    text = _ARTIFACT_RE.sub('', text)
+    # Keep: letters, digits, common punctuation, spaces
+    text = re.sub(r'[^\x20-\x7E]', ' ', text)
+    text = _WHITESPACE_RE.sub(' ', text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
+    """
+    Split `text` into overlapping word-level chunks.
+
+    Parameters
+    ----------
+    chunk_size  : target number of words per chunk
+    overlap     : number of words shared between consecutive chunks
+                  (gives the retriever cross-boundary context)
+
+    Why word-level and not character-level?
+    TF-IDF works on tokens (words), so word-count is the natural unit.
+    Character splits can cut words mid-token and skew IDF weights.
+    """
+    words = text.split()
+    if not words:
+        return []
+
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunk = ' '.join(words[start:end])
+        chunks.append(chunk)
+        # Advance by (chunk_size - overlap) so the next chunk
+        # re-uses the last `overlap` words of this one.
+        start += chunk_size - overlap
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Main loader
+# ---------------------------------------------------------------------------
+
+def load_pdfs(
+    folder_path: str,
+    chunk_size: int = 400,
+    overlap: int = 80,
+    min_chunk_words: int = 40,
+) -> list[dict]:
+    """
+    Load every PDF in `folder_path`, clean each page, split into
+    overlapping chunks, and return a flat list of chunk dicts.
+
+    Each dict has:
+        text   – cleaned chunk text
+        source – filename
+        page   – 1-based page number the chunk came from
+        chunk  – 0-based chunk index within that page
+
+    Parameters
+    ----------
+    chunk_size      : words per chunk (tune up for longer context,
+                      down for more precise retrieval)
+    overlap         : word overlap between consecutive chunks
+    min_chunk_words : discard chunks shorter than this (guards against
+                      near-blank pages and header-only fragments)
+    """
+    documents = []
+
+    pdf_files = sorted(f for f in os.listdir(folder_path) if f.endswith(".pdf"))
+
+    if not pdf_files:
+        print(f"[ingest] Warning: no PDF files found in '{folder_path}'")
+        return documents
+
+    for file in pdf_files:
+        path = os.path.join(folder_path, file)
+
+        try:
+            doc = fitz.open(path)
+        except Exception as e:
+            print(f"[ingest] Could not open {file}: {e}")
+            continue
+
+        for page_idx, page in enumerate(doc):
+            raw_text = page.get_text()
+            clean = clean_page_text(raw_text)
+
+            if len(clean.split()) < min_chunk_words:
+                # Whole page is nearly empty after cleaning — skip it
+                continue
+
+            chunks = chunk_text(clean, chunk_size=chunk_size, overlap=overlap)
+
+            for chunk_idx, chunk in enumerate(chunks):
+                if len(chunk.split()) < min_chunk_words:
+                    continue  # discard tiny tail chunks
+
+                documents.append({
+                    "text": chunk,
+                    "source": file,
+                    "page": page_idx + 1,
+                    "chunk": chunk_idx,
+                })
+
+        doc.close()
+
+    print(f"[ingest] Loaded {len(pdf_files)} PDFs → {len(documents)} chunks")
+    return documents
